@@ -1,0 +1,74 @@
+name: Python CI
+
+# push: 提交后自动运行；pull_request: PR 更新时运行；workflow_dispatch: 手动运行。
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.13'
+
+      # 测试失败会停止后续构建，不会上传产物。
+      - name: Test application
+        run: python -m unittest discover -s tests -v
+
+      - name: Build container image
+        run: docker build -t python-ci-demo:latest .
+
+      - name: Smoke test container
+        run: |
+          docker run -d --name ci-demo -p 127.0.0.1:8000:8000 python-ci-demo:latest
+          trap 'docker logs ci-demo; docker rm -f ci-demo' EXIT
+          curl --fail --silent --show-error --retry 10 --retry-delay 1 --retry-all-errors \
+            http://127.0.0.1:8000/health -o /tmp/health.json
+          python -c 'import json; assert json.load(open("/tmp/health.json")) == {"status": "ok"}'
+          python - <<'PY'
+          import html
+          import json
+          from urllib.request import urlopen
+          with open("config/app.json") as source:
+              message = json.load(source)["message"]
+          with urlopen("http://127.0.0.1:8000/", timeout=5) as response:
+              assert html.escape(message) in response.read().decode("utf-8")
+          PY
+
+      - name: Package image and configuration
+        run: |
+          mkdir -p dist
+          docker save python-ci-demo:latest | gzip > dist/python-ci-demo.tar.gz
+          python -m zipfile -c dist/config.zip config
+          python -m zipfile -t dist/config.zip
+
+      # archive: false 直接上传文件，避免 config.zip 外面再套一层 ZIP。
+      - name: Upload container image
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/python-ci-demo.tar.gz
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload configuration ZIP
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/config.zip
+          archive: false
+          if-no-files-found: error
+          retention-days: 7
